@@ -67,32 +67,121 @@ class HiddenEncoder(nn.Module):
 
         return im_w
 
-class HiddenDecoder(nn.Module):
-    """
-    Decoder module. Receives a watermarked image and extracts the watermark.
-    The input image may have various kinds of noise applied to it,
-    such as Crop, JpegCompression, and so on. See Noise layers for more.
-    """
-    def __init__(self, num_blocks, num_bits, channels):
+# CHANGED: 替换掉原来的HiddenDecoder
+# NEW: 这是一个新的、基于U-Net思想的分割式解码器 (我们的W_seg)
+# 它的作用是输出逐像素的检测掩码和消息张量
+class SegmentationDecoder(nn.Module):
+    def __init__(self, num_bits=32, channels=64):
+        super(SegmentationDecoder, self).__init__()
+        self.channels = channels
+        
+        # --- Encoder Path ---
+        self.enc1 = self.conv_block(3, channels)
+        self.enc2 = self.conv_block(channels, channels * 2)
+        self.enc3 = self.conv_block(channels * 2, channels * 4)
+        self.pool = nn.MaxPool2d(2)
 
-        super(HiddenDecoder, self).__init__()
+        # --- Bottleneck ---
+        self.bottleneck = self.conv_block(channels * 4, channels * 8)
 
-        layers = [ConvBNRelu(3, channels)]
-        for _ in range(num_blocks - 1):
-            layers.append(ConvBNRelu(channels, channels))
+        # --- Decoder Path ---
+        self.upconv3 = nn.ConvTranspose2d(channels * 8, channels * 4, kernel_size=2, stride=2)
+        self.dec3 = self.conv_block(channels * 8, channels * 4)
+        self.upconv2 = nn.ConvTranspose2d(channels * 4, channels * 2, kernel_size=2, stride=2)
+        self.dec2 = self.conv_block(channels * 4, channels * 2)
+        self.upconv1 = nn.ConvTranspose2d(channels * 2, channels, kernel_size=2, stride=2)
+        self.dec1 = self.conv_block(channels * 2, channels)
 
-        layers.append(ConvBNRelu(channels, num_bits))
-        layers.append(nn.AdaptiveAvgPool2d(output_size=(1, 1)))
-        self.layers = nn.Sequential(*layers)
+        # --- Output Layers ---
+        # 输出检测掩码 (1个通道) 和 消息张量 (num_bits个通道)
+        self.conv_out = nn.Conv2d(channels, num_bits + 1, kernel_size=1)
 
-        self.linear = nn.Linear(num_bits, num_bits)
+    def conv_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
-    def forward(self, img_w):
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        
+        # Bottleneck
+        b = self.bottleneck(self.pool(e3))
+        
+        # Decoder
+        d3 = self.upconv3(b)
+        d3 = torch.cat((e3, d3), dim=1)
+        d3 = self.dec3(d3)
+        
+        d2 = self.upconv2(d3)
+        d2 = torch.cat((e2, d2), dim=1)
+        d2 = self.dec2(d2)
+        
+        d1 = self.upconv1(d2)
+        d1 = torch.cat((e1, d1), dim=1)
+        d1 = self.dec1(d1)
+        
+        # Output
+        output = self.conv_out(d1)
+        
+        pred_mask = torch.sigmoid(output[:, :1, :, :]) # 第1个通道是检测掩码, 用sigmoid激活
+        pred_msg_tensor = output[:, 1:, :, :]         # 剩下的通道是消息张量, 保持logits输出
+        
+        return pred_mask, pred_msg_tensor
 
-        x = self.layers(img_w) # b d 1 1
-        x = x.squeeze(-1).squeeze(-1) # b d
-        x = self.linear(x) # b d
-        return x
+# CHANGED: 修改EncoderDecoder的forward方法来处理新的W_seg和局部化逻辑
+class EncoderDecoder(nn.Module):
+    def __init__(self, encoder, attenuation, data_aug, decoder, scale_channels, scaling_i, scaling_w, num_bits, redundancy):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.attenuation = attenuation
+        self.data_aug = data_aug
+        self.decoder = decoder # 现在这个decoder是SegmentationDecoder
+        self.scale_channels = scale_channels
+        self.scaling_i = scaling_i
+        self.scaling_w = scaling_w
+        self.num_bits = num_bits
+        self.redundancy = redundancy
+
+    # CHANGED: forward方法现在需要处理局部化逻辑
+    def forward(self, imgs, msgs, gt_mask, eval_mode=False, eval_aug=None):
+        
+        # 1. 嵌入器生成全局水印信号
+        fts_w = self.encoder(imgs, msgs) # 生成水印信号 delta
+        
+        if self.attenuation is not None:
+            fts_w = self.attenuation(imgs, fts_w, self.scale_channels)
+            
+        # 2. 生成带水印的图像
+        imgs_w = self.scaling_i * imgs + self.scaling_w * fts_w # 添加水印得到全局水印图
+        
+        # 3. NEW: 局部化水印
+        # 只在gt_mask指定的区域应用水印
+        imgs_w_local = gt_mask * imgs_w + (1 - gt_mask) * imgs
+
+        # 4. 攻击模拟 (Data Augmentation)
+        if eval_mode:
+            imgs_aug = eval_aug(imgs_w_local)
+            gt_mask_final = eval_aug(gt_mask) # 确保掩码同步变换
+        else:
+            # 在训练时，需要同步变换图像和掩码
+            # 为了简化，我们假设data_aug能同时处理图像和掩码
+            # 这需要在train_one_epoch中手动实现
+            imgs_aug = imgs_w_local # 占位符，实际增强在训练循环中处理
+            gt_mask_final = gt_mask   # 占位符
+        
+        # 5. 提取器进行分割和解码
+        pred_mask, pred_msg_tensor = self.decoder(imgs_aug)
+        
+        # 返回所有需要计算损失和统计的张量
+        return pred_mask, pred_msg_tensor, imgs_w, imgs_aug, gt_mask_final
 
 class AdvancedHiddenDecoder(nn.Module):
     """
